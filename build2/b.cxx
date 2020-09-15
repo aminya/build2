@@ -230,9 +230,8 @@ main (int argc, char* argv[])
   try
   {
     // Note that the diagnostics verbosity level can only be calculated after
-    // default options are loaded and merged (see below). Thus, to trace the
-    // default options files search, we refer to the verbosity level specified
-    // on the command line.
+    // default options are loaded and merged (see below). Thus, until then we
+    // refer to the verbosity level specified on the command line.
     //
     auto verbosity = [] ()
     {
@@ -372,7 +371,84 @@ main (int argc, char* argv[])
           args += ')';
       }
 
+      // If BUILD2_VAR_OVR environment variable is present, then parse its
+      // value as a newline-separated global variable overrides and prepend
+      // them to the variables specified on the command line.
+      //
+      // Note that currently we assume that the override value may not contain
+      // a newline.
+      //
+      // Verify that the string is a valid global override. Use the file name
+      // and the options flag only for diagnostics.
+      //
+      auto verify_ovr = [] (const string& v, const path_name& fn, bool opt)
+      {
+        size_t p (v.find ('=', 1));
+        if (p == string::npos || v[0] != '!')
+        {
+          diag_record dr (fail (fn));
+          dr << "expected " << (opt ? "option or " : "") << "global "
+             << "variable override instead of '" << v << "'";
+
+          if (p != string::npos)
+              dr << info << "prefix variable assignment with '!'";
+        }
+
+        if (p == 1 || (p == 2 && v[1] == '+')) // '!=' or '!+=' ?
+          fail (fn) << "missing variable name in '" << v << "'";
+      };
+
+      optional<string> env_ovr (getenv ("BUILD2_VAR_OVR"));
+
+      if (verbosity () >= 5)
+      {
+        if (env_ovr)
+          trace << "BUILD2_VAR_OVR: '" << *env_ovr << "'";
+        else
+          trace << "BUILD2_VAR_OVR: <NULL>";
+      }
+
+      if (env_ovr)
+      {
+        strings vars;
+        path_name fn ("<BUILD2_VAR_OVR>");
+
+        for (size_t p (0); p != string::npos; )
+        {
+          // Skip leading whitespaces.
+          //
+          p = env_ovr->find_first_not_of ("\n\r \t", p);
+
+          if (p != string::npos)
+          {
+            // Extract the override from the current line, stripping the
+            // trailing spaces.
+            //
+            size_t e (env_ovr->find_first_of ("\n\r", p));
+            string s (*env_ovr, p, e != string::npos ? e - p : string::npos);
+            trim (s);
+
+            // Verify and save the override.
+            //
+            verify_ovr (s, fn, false /* opt */);
+            vars.push_back (move (s));
+
+            p = e;
+          }
+        }
+
+        if (!vars.empty ())
+        {
+          vars.insert (vars.end (), cmd_vars.begin (), cmd_vars.end ());
+          cmd_vars.swap (vars);
+        }
+      }
+
       // Handle default options files.
+      //
+      // Prepend the default global overrides to the variables specified on
+      // the command line, unless BUILD2_VAR_OVR is set in which case just
+      // ignore them.
       //
       if (!ops.no_default_options ()) // Command line option.
       try
@@ -409,38 +485,27 @@ main (int argc, char* argv[])
         //
         ops = merge_default_options (def_ops, ops);
 
-        // Merge the default and command line global overrides.
+        // Merge the default and command line global overrides, unless
+        // BUILD2_VAR_OVR is set.
         //
         // Note that the "broken down" variable assignments occupying a single
         // line are naturally supported.
         //
-        cmd_vars =
-          merge_default_arguments (
-            def_ops,
-            cmd_vars,
-            [] (const default_options_entry<options>& e, const strings&)
-            {
-              path_name fn (e.file);
-
-              // Verify that all arguments are global overrides.
-              //
-              for (const string& a: e.arguments)
+        if (!env_ovr)
+          cmd_vars =
+            merge_default_arguments (
+              def_ops,
+              cmd_vars,
+              [&verify_ovr] (const default_options_entry<options>& e,
+                             const strings&)
               {
-                size_t p (a.find ('=', 1));
-                if (p == string::npos || a[0] != '!')
-                {
-                  diag_record dr (fail (fn));
-                  dr << "expected option or global variable override instead "
-                     << "of '" << a << "'";
+                path_name fn (e.file);
 
-                  if (p != string::npos)
-                    dr << info << "prefix variable assignment with '!'";
-                }
-
-                if (p == 1 || (p == 2 && a[1] == '+')) // '!=' or '!+=' ?
-                  fail (fn) << "missing variable name in '" << a << "'";
-              }
-            });
+                // Verify that all arguments are global overrides.
+                //
+                for (const string& a: e.arguments)
+                  verify_ovr (a, fn, true /* opt */);
+              });
       }
       catch (const pair<path, system_error>& e)
       {
@@ -450,6 +515,51 @@ main (int argc, char* argv[])
       catch (const system_error& e)
       {
         fail << "unable to obtain home directory: " << e;
+      }
+
+      // Save the global overrides present in cmd_vars (default, from the
+      // command line, etc) into BUILD2_VAR_OVR environment variable.
+      //
+      // Note that we set BUILD2_VAR_OVR even if there are no global overrides
+      // to disable usage of the default overrides for the potential build2
+      // nested executions. This, in particular, can be the case when
+      // --no-default-options is specified for the "top level" build2 and
+      // because of that the default overrides will also be ignored by the
+      // nested build2 calls, which feels natural.
+      //
+      {
+        string ovr;
+        for (const string& v: cmd_vars)
+        {
+          if (v[0] == '!')
+          {
+            if (!ovr.empty ())
+              ovr += '\n';
+
+            ovr += v;
+          }
+        }
+
+        // Note that on Windows setting an empty value unsets the variable
+        // (see butl::setenv() for details). To avoid this, we set
+        // BUILD2_VAR_OVR to a space character string.
+        //
+#ifdef _WIN32
+        if (ovr.empty ())
+          ovr = " ";
+#endif
+
+        try
+        {
+          if (verbosity () >= 5)
+            trace << "setting BUILD2_VAR_OVR='" << ovr << "'";
+
+          setenv ("BUILD2_VAR_OVR", ovr);
+        }
+        catch (const system_error& e)
+        {
+          fail << "unable to set environment variable BUILD2_VAR_OVR: " << e;
+        }
       }
 
       // Validate options.
